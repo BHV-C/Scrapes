@@ -1,0 +1,8 @@
+{
+  "name": "scrapekit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Small web scraper app for Vercel (serverless function + static UI)",
+  "engines": { "node": ">=18" },
+  "dependencies": { "cheerio": "1.0.0" }
+}
