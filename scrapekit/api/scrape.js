@@ -34,6 +34,90 @@ const PRESETS = {
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
+
+// ---- eBay official Browse API (free; needs EBAY_CLIENT_ID + EBAY_CLIENT_SECRET) ----
+let ebayToken = { value: null, exp: 0 };
+async function getEbayToken() {
+  if (ebayToken.value && Date.now() < ebayToken.exp) return ebayToken.value;
+  const basic = Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString("base64");
+  const r = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+    method: "POST",
+    headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" },
+    body: "grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope",
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error("eBay auth failed: " + (d.error_description || r.status));
+  ebayToken = { value: d.access_token, exp: Date.now() + (d.expires_in - 60) * 1000 };
+  return ebayToken.value;
+}
+
+async function ebayApi(target) {
+  const token = await getEbayToken();
+  const headers = { Authorization: `Bearer ${token}`, "X-EBAY-C-MARKETPLACE-ID": "EBAY_US" };
+  const money = (m) => (m ? `${m.value} ${m.currency}` : "");
+  const itm = target.pathname.match(/\/itm\/(?:[^/]+\/)?(\d{9,14})/);
+
+  if (itm) {
+    const r = await fetch(`https://api.ebay.com/buy/browse/v1/item/get_item_by_legacy_id?legacy_item_id=${itm[1]}`, { headers });
+    const d = await r.json();
+    if (!r.ok) throw new Error("eBay API: " + (d.errors?.[0]?.message || r.status));
+    return {
+      pageTitle: d.title,
+      rows: [{
+        title: d.title, price: money(d.price), condition: d.condition || "",
+        seller: d.seller?.username || "", location: d.itemLocation?.country || "",
+        image: d.image?.imageUrl || "", link: d.itemWebUrl || target.href,
+      }],
+    };
+  }
+
+  const q = target.searchParams.get("_nkw");
+  if (!q) throw new Error("Use an eBay item URL (/itm/...) or a search URL containing _nkw=");
+  const r = await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(q)}&limit=50`, { headers });
+  const d = await r.json();
+  if (!r.ok) throw new Error("eBay API: " + (d.errors?.[0]?.message || r.status));
+  return {
+    pageTitle: `eBay search: ${q}`,
+    rows: (d.itemSummaries || []).map((i) => ({
+      title: i.title, price: money(i.price), condition: i.condition || "",
+      seller: i.seller?.username || "", link: i.itemWebUrl,
+    })),
+  };
+}
+
+// ---- Generic product page: JSON-LD, then Open Graph fallback ----
+function productFromHtml($, base) {
+  let out = null;
+  $('script[type="application/ld+json"]').each((_, el) => {
+    if (out) return;
+    try {
+      const j = JSON.parse($(el).contents().text());
+      const nodes = [].concat(j, j["@graph"] || []);
+      const p = nodes.find((n) => n && [].concat(n["@type"]).includes("Product"));
+      if (p) {
+        const o = [].concat(p.offers || [])[0] || {};
+        out = {
+          title: p.name || "",
+          price: [o.price || o.lowPrice || "", o.priceCurrency || ""].join(" ").trim(),
+          brand: (p.brand && (p.brand.name || p.brand)) || "",
+          rating: p.aggregateRating ? `${p.aggregateRating.ratingValue} (${p.aggregateRating.reviewCount || p.aggregateRating.ratingCount || "?"})` : "",
+          image: [].concat(p.image || [])[0]?.url || [].concat(p.image || [])[0] || "",
+          link: base,
+        };
+      }
+    } catch {}
+  });
+  if (out) return out;
+  const og = (n) => $(`meta[property="${n}"]`).attr("content") || "";
+  return {
+    title: og("og:title") || $("title").text().trim(),
+    price: og("product:price:amount") || og("og:price:amount"),
+    image: og("og:image"),
+    description: og("og:description"),
+    link: base,
+  };
+}
+
 function isPrivateIp(ip) {
   if (net.isIPv6(ip)) {
     const l = ip.toLowerCase();
@@ -72,6 +156,12 @@ module.exports = async (req, res) => {
     const { url, preset, itemSelector, fields } = req.body || {};
     const target = await assertPublicUrl(url);
 
+    // eBay: prefer the official API when credentials are configured (eBay blocks cloud IPs).
+    if (/(^|\.)ebay\.[a-z.]+$/i.test(target.hostname) && process.env.EBAY_CLIENT_ID && process.env.EBAY_CLIENT_SECRET) {
+      const out = await ebayApi(target);
+      return res.status(200).json({ count: out.rows.length, pageTitle: out.pageTitle, rows: out.rows });
+    }
+
     // Optional: set SCRAPER_API_KEY in Vercel to route through ScraperAPI
     // (helps with Amazon/Etsy blocking datacenter IPs).
     const key = process.env.SCRAPER_API_KEY;
@@ -90,7 +180,7 @@ module.exports = async (req, res) => {
     const html = await r.text();
     if (!r.ok) {
       return res.status(502).json({
-        error: `Site responded ${r.status}. It may be blocking the request; try a ScraperAPI key.`,
+        error: `Site responded ${r.status}. It is blocking this server. For eBay, set EBAY_CLIENT_ID and EBAY_CLIENT_SECRET (free official API); for other sites, set SCRAPER_API_KEY.`,
       });
     }
     if (/captcha|robot check|unusual traffic/i.test(html.slice(0, 5000))) {
@@ -98,6 +188,10 @@ module.exports = async (req, res) => {
     }
 
     const $ = cheerio.load(html);
+    if (preset === "product") {
+      const row = productFromHtml($, target.href);
+      return res.status(200).json({ count: 1, pageTitle: $("title").first().text().trim(), rows: [row] });
+    }
     const cfg = preset && PRESETS[preset] ? PRESETS[preset] : { item: itemSelector, fields };
     if (!cfg.item || !cfg.fields || !Object.keys(cfg.fields).length) {
       return res.status(400).json({ error: "Provide an item selector and at least one field." });
